@@ -38,6 +38,9 @@ ASIN_RE = re.compile(r'(?<![A-Z0-9])([A-Z0-9]{10})(?![A-Z0-9])', re.I)
 DEVICE_RE = re.compile(r'(?i)\b(?:iPhone\s*(?:1[1-9]|[2-9][0-9]?)(?:\s*(?:Pro\s*Max|Pro|Plus|Mini))?|AirPods\s*(?:Pro\s*[123]?|[1234](?:st|nd|rd|th)?\s*Gen(?:eration)?|Max))\b')
 PRICE_RE = re.compile(r'(?<!\d)(\d{1,4}(?:[.,]\d{2})?)(?!\d)')
 ISO_RE = re.compile(r'\b(?:US|CA|MX|GB|UK|DE|FR|ES|IT|PL|NL|BE|SE|AE|SA|IN|AU|JP|CN|HK|SG|TR|VN|KR|TW|BR)\b')
+EMAIL_RE = re.compile(r'\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b', re.I)
+PHONE_RE = re.compile(r'(?<!\w)(?:\+?\d[\d\s().\-]{6,}\d)(?!\w)')
+REGISTRATION_RE = re.compile(r'(?i)\b(?:registration(?:\s+number|\s+no\.?)?|company\s+number|handelsregisternummer|registre\s+du\s+commerce|registro\s+mercantil|ust-?id|vat\s*(?:id|number)|eori)\s*[:#-]?\s*([A-Z0-9][A-Z0-9 ./-]{3,40})')
 LOG = logging.getLogger('amazon-agent')
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -58,6 +61,29 @@ def num(s):
     elif v.count('.')>1: v=v.replace('.','')
     try: return float(v)
     except ValueError:return None
+
+def extract_contact_data(text):
+    emails=list(dict.fromkeys(EMAIL_RE.findall(text or '')))
+    phones=[]
+    for value in PHONE_RE.findall(text or ''):
+        value=clean(value)
+        digits=re.sub(r'\D','',value)
+        if 7 <= len(digits) <= 16: phones.append(value)
+    registrations=[]
+    for match in REGISTRATION_RE.finditer(text or ''):
+        value=clean(match.group(1)).rstrip('.,;')
+        if value and value not in registrations:registrations.append(value)
+    return emails,phones,registrations
+
+def classify_shipping(text):
+    value=clean(text)
+    low=value.lower()
+    if not value:return 'UNKNOWN'
+    if any(token in low for token in ('ships from amazon','versand durch amazon','expédié par amazon','spedito da amazon','enviado por amazon')):
+        return 'AMAZON'
+    if any(token in low for token in ('ships from seller','versand durch den verkäufer','versand durch verkäufer','expédié par le vendeur','spedito dal venditore')):
+        return 'SELLER'
+    return 'SHOWN_TEXT_ONLY'
 
 def asin_from(text):
     p=urlparse(text)
@@ -137,7 +163,8 @@ def parse_product(html, asin, market):
     return {'marketplace':market,'asin':asin,'product_url':url_asin(asin,market),'image_url':image_url,
         'title':title,'highlights':' | '.join(bullets),'device_model':device,'price_text':price_text,
         'price_numeric':num(price_text),'currency':CURRENCY.get(market,''),'delivery_zip':'','buybox':'YES' if price_text and (seller_name or shipping) else 'UNKNOWN',
-        'in_stock':status,'ships_from':shipping,'sold_by':seller_name,'seller_id':seller_id,
+        'in_stock':status,'ships_from':shipping,'ships_from_entity':classify_shipping(shipping),
+        'sold_by':seller_name,'seller_id':seller_id,
         'variations':variation,'offer_count':offer_count,'rating':rating,'rating_count':int(num(review_text) or 0) if review_text else None,
         'bsr':bsr,'date_first_available':first_available,'item_details':specs,'source':'amazon_page',
         'observed_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),'status':'OK' if title else 'UNVERIFIED'}
@@ -146,6 +173,15 @@ def parse_seller(html, seller_id,market):
     s=BeautifulSoup(html,'lxml');all_text=txt(s)
     title=pick(s,'#sellerName','#seller-name','h1','h2')
     legal_name=''; address=''; returns=''
+    emails,phones,registrations=extract_contact_data(all_text)
+    vat_match=re.search(r'(?i)\bVAT(?:\s*(?:ID|number|no\.?)?)?\s*[:#-]?\s*([A-Z]{2}[A-Z0-9 .\-/]{4,30})',all_text)
+    eori_match=re.search(r'(?i)\bEORI\s*(?:number|no\.?)?\s*[:#-]?\s*([A-Z]{2}[A-Z0-9 .\-/]{4,30})',all_text)
+    company_match=re.search(r'(?i)\b(?:company\s+(?:registration\s+)?(?:number|no\.?)|registration\s+number|handelsregisternummer)\s*[:#-]?\s*([A-Z0-9 .\-/]{4,40})',all_text)
+    documents=[]
+    for link in s.select('a[href]'):
+        label=clean(link.get_text(' ',strip=True));href=link.get('href','')
+        if re.search(r'(?i)(impressum|legal|business|registration|register|vat|eori|terms)',label+' '+href):
+            documents.append(f'{label or href} -> {href}')
     # Block-specific parsing; preserve full content rather than fabricating precise labels.
     for node in s.select('div,section'):
         t=txt(node)
@@ -163,6 +199,9 @@ def parse_seller(html, seller_id,market):
     rating=None
     m=re.search(r'(\d(?:[.,]\d)?)\s*(?:out of|von|sur|de)\s*5',all_text,re.I)
     if m:rating=num(m.group(1))
+    rating_count=None
+    m=re.search(r'(\d[\d,. ]*)\s*(?:ratings|bewertungen|évaluations|reviews|feedback)',all_text,re.I)
+    if m and num(m.group(1)) is not None:rating_count=int(num(m.group(1)))
     feedback={}
     for period in ('1 month','3 months','12 months','lifetime'):
         feedback[period]={'rating': None, 'ratings':None, 'positive_percent':None, 'status':'NOT_COLLECTED'}
@@ -172,8 +211,15 @@ def parse_seller(html, seller_id,market):
         if addr_iso=='UK':addr_iso='GB'
     return {'seller_id':seller_id,'marketplace':market,'name':title,'seller_url':url_seller(seller_id,market),
             'storefront_url':url_store(seller_id,market),'positive_12m_percent':positive,
-            'positive_12m_text':positive_text,'visible_rating':rating,'feedback':feedback,
+            'positive_12m_text':positive_text,'visible_rating':rating,'visible_rating_count':rating_count,'feedback':feedback,
             'legal_name':legal_name,'business_address':address,'country_code':addr_iso,
+            'contact_email':' | '.join(emails),'contact_phone':' | '.join(phones),
+            'company_registration_number':(company_match.group(1).strip() if company_match else (registrations[0] if registrations else '')),
+            'vat_number':vat_match.group(1).strip() if vat_match else '',
+            'eori_number':eori_match.group(1).strip() if eori_match else '',
+            'registration_documents':' | '.join(dict.fromkeys(documents)),
+            'contact_status':'OBSERVED' if emails or phones else 'NOT_SHOWN',
+            'registration_status':'OBSERVED' if company_match or vat_match or eori_match or registrations or documents else 'NOT_SHOWN',
             'return_policy':returns,'observed_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'status':'OK' if legal_name or positive is not None else 'PARTIAL'}
 
@@ -247,12 +293,14 @@ def collect_storefront(page,seller_id,market,max_pages=3):
 PRODUCT_COLS=[('marketplace','Marketplace'),('asin','ASIN'),('product_url','Product URL'),('image_url','Image URL'),
 ('title','Product Title'),('highlights','Item Highlights'),('device_model','Device Model'),('price_text','Price Raw'),
 ('price_numeric','Price Number'),('currency','Currency'),('buybox','Buy Box'),('in_stock','In Stock'),
-('ships_from','Ships From'),('sold_by','Sold By'),('seller_id','Seller ID'),('variations','Variations'),
+('ships_from','Ships From Raw'),('ships_from_entity','Ships From Entity'),('sold_by','Sold By'),('seller_id','Seller ID'),('variations','Variations'),
 ('offer_count','Offer Count'),('rating','Product Rating'),('rating_count','Review Count'),('bsr','Best Sellers Rank'),
 ('date_first_available','Date First Available'),('observed_at','Observed UTC'),('status','Data Status'),
 ('delivery_zip','Delivery ZIP / City')]
 SELLER_COLS=['seller_id','marketplace','name','seller_url','storefront_url','legal_name','business_address',
-'country_code','positive_12m_percent','positive_12m_text','visible_rating','return_policy','observed_at','status']
+'country_code','positive_12m_percent','positive_12m_text','visible_rating','visible_rating_count',
+'contact_email','contact_phone','company_registration_number','vat_number','eori_number',
+'registration_documents','contact_status','registration_status','return_policy','page_status','observed_at','status']
 
 def safe_filename(s):return re.sub(r'[^A-Za-z0-9_.-]','_',s)[:85]
 
@@ -524,6 +572,9 @@ def run(seeds,out_dir,headless=False,max_pages=3,max_products=100,delay=2.0,zips
             url=url_seller(seller_id,market);html,state=navigate(page,url)
             g['events'].append({'url':url,'status':state,'observed_at':datetime.now(timezone.utc).isoformat(timespec='seconds')})
             seller=parse_seller(html,seller_id,market) if html else parse_seller('',seller_id,market)
+            seller['page_status']=state
+            if not html:
+                seller['status']=state
             if html: seller=collect_feedback_windows(page,seller)
             g['seller']=seller
             time.sleep(delay)

@@ -4,6 +4,9 @@ __pycache__/
 .pytest_cache/
 reports/
 **/reports/
+xray helium10/*.xlsx
+xray helium10/*.xls
+xray helium10/*.csv
 ~$*.xlsx
 **/~$*.xlsx
 .env
