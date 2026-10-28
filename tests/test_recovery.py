@@ -25,6 +25,15 @@ PRODUCT_HTML = '''<span id="productTitle">Example product</span>
 <div id="acrPopover"><span class="a-icon-alt">4.6 out of 5 stars</span></div><span id="acrCustomerReviewText">321 ratings</span>'''
 
 
+def fake_playwright():
+    factory=MagicMock()
+    page=factory.return_value.__enter__.return_value.chromium.launch.return_value.new_context.return_value.new_page.return_value
+    page.url='https://www.amazon.com/sp?seller=A123456789'
+    page.title.return_value='Seller Profile: Example Seller'
+    page.content.return_value=SELLER_HTML
+    return factory
+
+
 class SellerParsingTests(unittest.TestCase):
     def test_exact_rating_and_separate_periods(self):
         s=agent.parse_seller(SELLER_HTML,'A123456789','DE')
@@ -88,7 +97,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_profile_is_collected_before_next_product_and_survives_interrupt(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(agent,'sync_playwright'), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),(SELLER_HTML,'HTTP_200'),agent.BrowserClosedError('closed')]) as nav:
+            with patch.object(agent,'sync_playwright',fake_playwright()), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),(SELLER_HTML,'HTTP_200'),agent.BrowserClosedError('closed')]) as nav:
                 with self.assertRaises(agent.BrowserClosedError):
                     agent.run([('B000000001','US'),('B000000002','US')],tmp,delay=0,skip_storefront=True)
             self.assertIn('/sp?',nav.call_args_list[1].args[1])
@@ -109,11 +118,11 @@ class RecoveryTests(unittest.TestCase):
 
     def test_failed_profile_does_not_count_as_completed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(agent,'sync_playwright'), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),('','BLOCKED_CHALLENGE')]):
-                n=agent.run([('B000000001','US')],tmp,delay=0,skip_storefront=True)
+            with patch.object(agent,'sync_playwright',fake_playwright()), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),('','BLOCKED_CHALLENGE')]):
+                with self.assertRaises(agent.ProfileAccessRequired):
+                    agent.run([('B000000001','US')],tmp,delay=0,skip_storefront=True)
             state=agent.load_resume(tmp)
-            self.assertEqual(n,0)
-            self.assertEqual(state['run_status'],'PARTIAL')
+            self.assertEqual(state['run_status'],'ACTION_REQUIRED')
             self.assertEqual(state['groups'][0]['seller']['contact_status'],'NOT_COLLECTED')
 
     def test_legacy_report_resume_retries_missing_profiles(self):

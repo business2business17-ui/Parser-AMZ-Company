@@ -16,6 +16,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.utils import get_column_letter
+from profile_fetch import fetch_profile, ProfileAccessRequired, MANUAL_STATES, manual_navigation
 
 MARKETS = {
 'US':('www.amazon.com','ATVPDKIKX0DER'), 'CA':('www.amazon.ca','A2EUQ1WTGCTBG2'),
@@ -196,6 +197,7 @@ def navigate(page,url,wait_ms=1200):
     try:
         response=page.goto(url,wait_until='domcontentloaded',timeout=35000)
         page.wait_for_timeout(wait_ms)
+        if urlparse(page.url).path.startswith('/checkpoint/'):return '', 'CHECKPOINT_REQUIRED'
         if detect_block(page):return '', 'BLOCKED_CHALLENGE'
         return page.content(), f'HTTP_{response.status if response else "UNKNOWN"}'
     except Exception as exc:
@@ -210,11 +212,15 @@ def storefront_asins(html):
         if re.fullmatch(r'[A-Z0-9]{10}',asin) and asin not in result:result.append(asin)
     return result
 
-def collect_storefront(page,seller_id,market,max_pages=3):
+def collect_storefront(page,seller_id,market,max_pages=3,manual=False):
     collected=[]; seen=set();log=[]
     for index in range(1,max_pages+1):
         url=url_store(seller_id,market)+f'&page={index}'
         html,state=navigate(page,url)
+        if state in MANUAL_STATES:
+            if not manual:raise ProfileAccessRequired(f'{state}: storefront needs verification; resume with --no-headless --resume.')
+            html,state=manual_navigation(page,url,navigate,state)
+            if state in MANUAL_STATES:raise ProfileAccessRequired(f'{state}: storefront verification is still required.')
         log.append({'url':url,'status':state,'observed_at':datetime.now(timezone.utc).isoformat(timespec='seconds')})
         if not html:break
         page_asins=storefront_asins(html)
@@ -233,7 +239,7 @@ PRODUCT_COLS=[('marketplace','Marketplace'),('asin','ASIN'),('product_url','Prod
 SELLER_COLS=['seller_id','marketplace','name','seller_url','storefront_url','legal_name','business_address',
 'country_code','positive_12m_percent','positive_12m_text','visible_rating','visible_rating_count',
 'contact_email','contact_phone','company_registration_number','vat_number','eori_number',
-'registration_documents','contact_status','registration_status','return_policy','page_status','observed_at','status','feedback_period','profile_source']
+'registration_documents','contact_status','registration_status','return_policy','page_status','observed_at','status','feedback_period','profile_source','page_title','diagnostic_html']
 
 def safe_filename(s):return re.sub(r'[^A-Za-z0-9_.-]','_',s)[:85]
 
@@ -523,6 +529,7 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
     seller_keys={(p['marketplace'],p['seller_id']) for p in products.values() if p.get('seller_id')}
     groups={(g['marketplace'],g['seller_id']):g for g in old.get('groups',[]) if (g['marketplace'],g['seller_id']) in seller_keys}
     events=[];run_status='RUNNING';located={};current_market=None
+    attempted_profiles=set();profile_failures=0
     zips={**ZIPS,**CITY_MARKETS,**(zips or {})}
     def add_event(url,status,sink=events):
         sink.append({'url':url,'status':status,'observed_at':datetime.now(timezone.utc).isoformat(timespec='seconds')})
@@ -549,8 +556,11 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
         add_event(f'delivery:{market}:{zips.get(market,"")}',f'{status} {shown}'.strip())
         if status!='OK':LOG.warning('Delivery location for %s not confirmed: %s',market,status)
     def collect_profile(page,market,seller_id,g):
+        nonlocal profile_failures
         previous=g.get('seller') or {}
         if previous.get('name') and previous.get('status') in ('OK','RETAIL_PROFILE_NOT_APPLICABLE'):return
+        if (market,seller_id) in attempted_profiles:return
+        attempted_profiles.add((market,seller_id))
         product=next(iter(g['products'].values()))
         name=product.get('sold_by','')
         if name.lower() in ('amazon',MARKETS[market][0].removeprefix('www.')):
@@ -560,15 +570,18 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
             add_event(product['product_url'],'RETAIL_PROFILE_NOT_APPLICABLE: Sold by '+name,g['events'])
             save_group(market,seller_id,g);checkpoint(export=True)
             return
-        url=url_seller(seller_id,market);html,state=navigate(page,url)
-        add_event(url,state,g['events'])
-        seller=parse_seller(html,seller_id,market);seller['page_status']=state;seller['profile_source']=url
-        if not html:
-            seller['status']=state
-            seller['contact_status']=seller['registration_status']='NOT_COLLECTED'
+        url=url_seller(seller_id,market)
+        seller,profile_events=fetch_profile(page,seller_id,market,url,navigate,parse_seller,out_dir/'diagnostics',manual=not headless)
+        g['events'].extend(profile_events)
         g['seller']=seller
         save_group(market,seller_id,g);checkpoint(export=True)
-        LOG.info('Seller %s: %s / %s',seller_id,seller.get('name') or '(not retrieved)',seller['status'])
+        LOG.info('Seller %s: %s / %s',seller_id,seller.get('name') or (name+' (from listing)'),seller['status'])
+        if seller.get('diagnostic_html'):LOG.warning('Profile diagnostic: %s; page: %s',seller['diagnostic_html'],seller.get('page_title'))
+        profile_failures=0 if seller['status']=='OK' else profile_failures+1
+        if seller['status'] in MANUAL_STATES or seller['status'] in ('HTTP_401','HTTP_403','HTTP_429','ACCESS_DENIED'):
+            raise ProfileAccessRequired(f'{seller["status"]}: seller profile unavailable. Progress saved. For a verification page, resume with --no-headless --resume.')
+        if profile_failures>=3:
+            raise ProfileAccessRequired('Three consecutive seller profiles could not be loaded. Stopped to avoid empty reports. See diagnostics and resume after resolving the cause.')
         time.sleep(delay)
     try:
         checkpoint(export=True)
@@ -583,6 +596,10 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
                     product=products.get((market,asin))
                     if not (product and product.get('title') and product.get('seller_id') and product.get('status')=='OK'):
                         url=url_asin(asin,market);html,state=navigate(page,url);add_event(url,state)
+                        if state in MANUAL_STATES:
+                            if headless:raise ProfileAccessRequired(f'{state}: resume with --no-headless --resume to complete verification.')
+                            html,state=manual_navigation(page,url,navigate,state)
+                            if state in MANUAL_STATES:raise ProfileAccessRequired(f'{state}: verification is still required.')
                         product=parse_product(html,asin,market) if html else missing_product(asin,market,state)
                         product['delivery_zip']=located.get(market,'')
                         if html and not product.get('seller_id'):product['status']='NO_SELLER_ID' if product.get('title') else 'UNVERIFIED'
@@ -600,10 +617,14 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
                     for (market,seller_id),g in groups.items():
                         if g.get('catalog_done'):continue
                         ensure_location(page,market)
-                        catalog,logs=collect_storefront(page,seller_id,market,max_pages);g['events'].extend(logs)
+                        catalog,logs=collect_storefront(page,seller_id,market,max_pages,manual=not headless);g['events'].extend(logs)
                         for asin in catalog[:max_products]:
                             if asin in g['products']:continue
                             url=url_asin(asin,market);html,state=navigate(page,url);add_event(url,state,g['events'])
+                            if state in MANUAL_STATES:
+                                if headless:raise ProfileAccessRequired(f'{state}: catalog product needs verification; resume with --no-headless --resume.')
+                                html,state=manual_navigation(page,url,navigate,state)
+                                if state in MANUAL_STATES:raise ProfileAccessRequired(f'{state}: verification is still required.')
                             p=parse_product(html,asin,market) if html else missing_product(asin,market,state)
                             p['delivery_zip']=located.get(market,'')
                             if p.get('seller_id') and p['seller_id']!=seller_id:p['status']='DIFFERENT_BUYBOX_SELLER'
@@ -617,6 +638,9 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
                 run_status='COMPLETED' if good_products and good_sellers and good_catalog else 'PARTIAL'
             finally:
                 if browser.is_connected():browser.close()
+    except ProfileAccessRequired as exc:
+        run_status='ACTION_REQUIRED';add_event('run',str(exc))
+        raise
     except (BrowserClosedError,KeyboardInterrupt) as exc:
         run_status='INTERRUPTED';add_event('run',f'{type(exc).__name__}: {exc}')
         raise
@@ -716,6 +740,10 @@ def main(argv=None):
     except KeyboardInterrupt:
         LOG.warning('Interrupted. Resume with --resume "%s"',out)
         return 130
+    except ProfileAccessRequired as exc:
+        LOG.error('%s',exc)
+        LOG.error('Resume: run.bat --no-headless --resume "%s"',out)
+        return 3
     except Exception:
         LOG.exception('Run failed. Diagnostic result, if saved: %s',out/'result.xlsx')
         return 1
