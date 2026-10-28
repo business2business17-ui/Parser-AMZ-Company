@@ -2,7 +2,7 @@
   "input_dir": "xray helium10",
   "output_dir": "reports",
   "marketplace": null,
-  "headless": false,
+  "headless": true,
   "max_pages": 3,
   "max_products": 100,
   "delay": 2.0
