@@ -75,5 +75,28 @@ class ProfileFetchTests(unittest.TestCase):
             self.assertEqual(state['groups'][0]['seller']['status'],'CHECKPOINT_REQUIRED')
             self.assertEqual(state['products'][1]['status'],'NOT_PROCESSED')
 
+    def test_manual_verification_stays_open_beyond_three_minutes(self):
+        page=self.page('https://www.amazon.com/checkpoint/continue?token=secret')
+        elapsed=[0]
+        def user_completes_later(_):
+            elapsed[0]+=180
+            if elapsed[0]>=360:page.url='https://www.amazon.com/'
+        page.wait_for_timeout.side_effect=user_completes_later
+        nav=MagicMock(return_value=(SELLER_HTML,'HTTP_200'))
+        with patch.object(profile_fetch.time,'monotonic',side_effect=lambda:elapsed[0]):
+            _,status=profile_fetch.manual_navigation(page,'https://www.amazon.com/sp?seller=A123456789',nav,'CHECKPOINT_REQUIRED')
+        self.assertEqual(status,'HTTP_200')
+        self.assertEqual(elapsed[0],360)
+        page.bring_to_front.assert_called_once()
+        nav.assert_called_once()
+
+    def test_explicit_manual_timeout_is_still_supported(self):
+        page=self.page('https://www.amazon.com/checkpoint/continue?token=secret')
+        nav=MagicMock()
+        with patch.object(profile_fetch.time,'monotonic',side_effect=[0,0,2]):
+            with self.assertRaises(profile_fetch.ProfileAccessRequired):
+                profile_fetch.manual_navigation(page,'https://www.amazon.com/',nav,'CHECKPOINT_REQUIRED',timeout=1)
+        nav.assert_not_called()
+
 
 if __name__=='__main__':unittest.main()

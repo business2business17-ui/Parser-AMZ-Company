@@ -50,13 +50,16 @@ def response_problem(html, status, url):
     return ''
 
 
-def manual_navigation(page, url, navigate, status, timeout=180):
+def manual_navigation(page, url, navigate, status, timeout=None):
     """Let the user complete the site's UI. Never click or solve its verification."""
+    page.bring_to_front()
+    waiting = (f'within {timeout} seconds' if timeout is not None
+               else 'when ready; there is no automatic timeout (Ctrl+C stops the parser)')
     logging.getLogger('amazon-agent').warning(
-        '%s: complete the verification in the open browser within %s seconds. '
-        'Do not close the browser. The parser will continue after you finish.', status, timeout)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+        '%s: complete the verification in the open browser %s. '
+        'Do not close the browser. The parser will continue after you finish.', status, waiting)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while deadline is None or time.monotonic() < deadline:
         page.wait_for_timeout(1000)
         html = page.content()
         if response_problem(html, 'HTTP_200', page.url) not in MANUAL_STATES:
