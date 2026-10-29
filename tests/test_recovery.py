@@ -19,7 +19,7 @@ SELLER_HTML = '''<h1 id="seller-name">Example Seller</h1>
 <div id="rating-lifetime"><span class="ratings-reviews">4.6</span><span class="ratings-reviews-count">2,563</span></div>
 <footer>Copyright 1996-2026 <a href="/ap/register">Register</a><a href="/business">Amazon Business</a>
 <a href="mailto:amazon@example.com">Support</a> Phone: +1 999 999 9999</footer>'''
-PRODUCT_HTML = '''<span id="productTitle">Example product</span>
+PRODUCT_HTML = '''<span id="glow-ingress-line2">Los Angeles 90001</span><span id="productTitle">Example product</span>
 <div id="merchantInfoFeature_feature_div"><a id="sellerProfileTriggerId" href="/sp?seller=A123456789">Example Seller</a></div>
 <div id="fulfillerInfoFeature_feature_div"><span class="offer-display-feature-text-message">Amazon</span></div>
 <div id="acrPopover"><span class="a-icon-alt">4.6 out of 5 stars</span></div><span id="acrCustomerReviewText">321 ratings</span>'''
@@ -86,7 +86,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_interrupt_writes_checkpoint_and_remaining_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(agent,'sync_playwright'), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',side_effect=agent.BrowserClosedError('closed')) as nav:
+            with patch.object(agent,'sync_playwright'), patch.object(agent,'set_delivery',return_value=('OK','90001')), patch.object(agent,'navigate',side_effect=agent.BrowserClosedError('closed')) as nav:
                 with self.assertRaises(agent.BrowserClosedError):
                     agent.run([('B000000001','US'),('B000000002','US')],tmp,delay=0)
             self.assertEqual(nav.call_count,1)
@@ -97,14 +97,14 @@ class RecoveryTests(unittest.TestCase):
 
     def test_profile_is_collected_before_next_product_and_survives_interrupt(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(agent,'sync_playwright',fake_playwright()), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),(SELLER_HTML,'HTTP_200'),agent.BrowserClosedError('closed')]) as nav:
+            with patch.object(agent,'sync_playwright',fake_playwright()), patch.object(agent,'set_delivery',return_value=('OK','90001')), patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),(SELLER_HTML,'HTTP_200'),agent.BrowserClosedError('closed')]) as nav:
                 with self.assertRaises(agent.BrowserClosedError):
                     agent.run([('B000000001','US'),('B000000002','US')],tmp,delay=0,skip_storefront=True)
             self.assertIn('/sp?',nav.call_args_list[1].args[1])
             state=agent.load_resume(tmp)
             self.assertEqual(state['groups'][0]['seller']['name'],'Example Seller')
             self.assertEqual(state['run_status'],'INTERRUPTED')
-            with patch.object(agent,'sync_playwright'), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',return_value=(PRODUCT_HTML,'HTTP_200')) as nav:
+            with patch.object(agent,'sync_playwright'), patch.object(agent,'set_delivery',return_value=('OK','90001')), patch.object(agent,'navigate',return_value=(PRODUCT_HTML,'HTTP_200')) as nav:
                 n=agent.run([('B000000001','US'),('B000000002','US')],tmp,delay=0,skip_storefront=True,resume_data=state)
             self.assertEqual(n,1)
             self.assertEqual(nav.call_count,1)
@@ -118,7 +118,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_failed_profile_does_not_count_as_completed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(agent,'sync_playwright',fake_playwright()), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),('','BLOCKED_CHALLENGE')]):
+            with patch.object(agent,'sync_playwright',fake_playwright()), patch.object(agent,'set_delivery',return_value=('OK','90001')), patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),('','BLOCKED_CHALLENGE')]):
                 with self.assertRaises(agent.ProfileAccessRequired):
                     agent.run([('B000000001','US')],tmp,delay=0,skip_storefront=True)
             state=agent.load_resume(tmp)
@@ -139,7 +139,7 @@ class RecoveryTests(unittest.TestCase):
     def test_amazon_retail_uses_observed_name_without_fabricating_profile(self):
         html=PRODUCT_HTML.replace('Example Seller','Amazon.com')
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(agent,'sync_playwright'), patch.object(agent,'set_delivery',return_value=('OK','10001')), patch.object(agent,'navigate',return_value=(html,'HTTP_200')) as nav:
+            with patch.object(agent,'sync_playwright'), patch.object(agent,'set_delivery',return_value=('OK','90001')), patch.object(agent,'navigate',return_value=(html,'HTTP_200')) as nav:
                 agent.run([('B000000001','US')],tmp,delay=0,skip_storefront=True)
             state=agent.load_resume(tmp);seller=state['groups'][0]['seller']
             self.assertEqual(nav.call_count,1)

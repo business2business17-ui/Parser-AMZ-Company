@@ -66,7 +66,7 @@ class ProfileFetchTests(unittest.TestCase):
         page=factory.return_value.__enter__.return_value.chromium.launch.return_value.new_context.return_value.new_page.return_value
         page.url='https://www.amazon.com/checkpoint/continue?token=secret'
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(agent,'sync_playwright',factory),patch.object(agent,'set_delivery',return_value=('OK','10001')),patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),('','CHECKPOINT_REQUIRED')]) as nav:
+            with patch.object(agent,'sync_playwright',factory),patch.object(agent,'set_delivery',return_value=('OK','90001')),patch.object(agent,'navigate',side_effect=[(PRODUCT_HTML,'HTTP_200'),('','CHECKPOINT_REQUIRED')]) as nav:
                 with self.assertRaises(agent.ProfileAccessRequired):
                     agent.run([('B000000001','US'),('B000000002','US')],tmp,delay=0,skip_storefront=True)
             state=agent.load_resume(tmp)

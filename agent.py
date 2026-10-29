@@ -31,8 +31,8 @@ MARKETS = {
 }
 CURRENCY = {'US':'USD','CA':'CAD','MX':'MXN','UK':'GBP','DE':'EUR','FR':'EUR','ES':'EUR','IT':'EUR','PL':'PLN',
 'NL':'EUR','BE':'EUR','SE':'SEK','AE':'AED','SA':'SAR','IN':'INR','AU':'AUD','JP':'JPY'}
-# Default delivery postal codes (central city of each country). AE/SA choose a city instead of a code.
-ZIPS = {'US':'10001','CA':'M5V 2T6','MX':'06600','UK':'SW1A 1AA','DE':'10115','FR':'75001','ES':'28001',
+# Default delivery locations. US uses Los Angeles; AE/SA choose a city.
+ZIPS = {'US':'90001','CA':'M5V 2T6','MX':'06600','UK':'SW1A 1AA','DE':'10115','FR':'75001','ES':'28001',
 'IT':'00100','PL':'00-001','NL':'1012 AB','BE':'1000','SE':'111 20','IN':'110001','AU':'2000','JP':'100-0001'}
 CITY_MARKETS = {'AE':'Dubai','SA':'Riyadh'}
 ASIN_RE = re.compile(r'(?<![A-Z0-9])([A-Z0-9]{10})(?![A-Z0-9])', re.I)
@@ -379,11 +379,18 @@ def resolve_seeds(rows,default_market):
         result.append((asin,market))
     return list(dict.fromkeys(result))
 
+def delivery_matches(shown,zipcode):
+    expected=re.sub(r'\s+','',str(zipcode or '')).casefold()
+    observed=re.sub(r'\s+','',str(shown or '')).casefold()
+    if not expected:return False
+    if expected.isdigit():return bool(re.search(r'(?<!\d)'+re.escape(expected)+r'(?!\d)',observed))
+    return expected in observed
+
 def _set_delivery_once(page,market,zipcode):
     """Set the ordinary 'Deliver to' postal code via the site's own UI. Returns (status, shown_location)."""
     if not zipcode:return 'NO_ZIP_FOR_MARKET',''
     html,state=navigate(page,f'https://{MARKETS[market][0]}/')
-    if not html:return state,''
+    if not html or state!='HTTP_200':return state,''
     try:
         try:page.wait_for_load_state('load',timeout=15000)
         except Exception:pass
@@ -408,7 +415,7 @@ def _set_delivery_once(page,market,zipcode):
             if page.locator('#GLUXZipUpdateInput_1').count() and len(parts)==2:
                 inp.fill(parts[0]);page.locator('#GLUXZipUpdateInput_1').first.fill(parts[1]);inp.press('Enter')
             else:
-                inp.click();inp.type(zipcode,delay=60);inp.press('Enter')
+                inp.fill(zipcode);inp.press('Enter')
             page.wait_for_timeout(2000)
             if inp.is_visible():  # Enter did not submit: use the Apply button
                 page.locator('#GLUXZipUpdate input, #GLUXZipUpdate').first.click(timeout=5000)
@@ -421,7 +428,7 @@ def _set_delivery_once(page,market,zipcode):
         page.wait_for_timeout(1200)
         page.reload(wait_until='domcontentloaded');page.wait_for_timeout(1000)
         shown=clean(page.locator('#glow-ingress-line2').first.inner_text(timeout=3000))
-        ok=zipcode.replace(' ','').lower() in shown.replace(' ','').lower()
+        ok=delivery_matches(shown,zipcode)
         return ('OK' if ok else 'UNVERIFIED'),shown
     except Exception as exc:
         if browser_closed(exc) or isinstance(exc,BrowserClosedError):raise BrowserClosedError(str(exc)) from exc
@@ -431,11 +438,11 @@ def set_delivery(page,market,zipcode,attempts=3):
     status,shown='ERROR',''
     for _ in range(attempts):
         status,shown=_set_delivery_once(page,market,zipcode)
-        if status in ('OK','NO_ZIP_FOR_MARKET','BLOCKED_CHALLENGE'):break
+        if status in ('OK','NO_ZIP_FOR_MARKET',*MANUAL_STATES,'HTTP_401','HTTP_403','HTTP_429','ACCESS_DENIED'):break
         page.wait_for_timeout(1500)
     return status,shown
 
-def export_run_report(out_path,seeds,products,groups,events,run_status='UNKNOWN'):
+def export_run_report(out_path,seeds,products,groups,events,run_status='UNKNOWN',delivery_settings=None):
     """Export an overall result, including unavailable seed products."""
     wb=Workbook(); summary=wb.active;summary.title='Summary'
     for row in [
@@ -449,6 +456,7 @@ def export_run_report(out_path,seeds,products,groups,events,run_status='UNKNOWN'
         ['Run status',run_status],
         ['Sellers identified',len(groups)],
         ['Seed products not processed',sum(p.get('status')=='NOT_PROCESSED' for p in products)],
+        ['Requested delivery',', '.join(f'{market} {(delivery_settings or {}).get(market,"not specified")}' for market in sorted({m for _,m in seeds}))],
     ]:summary.append(row)
     style_sheet(summary,2);summary.column_dimensions['A'].width=40;summary.column_dimensions['B'].width=70
     sheet=wb.create_sheet('Products');sheet.append([label for _,label in PRODUCT_COLS])
@@ -525,12 +533,17 @@ def load_resume(folder):
 def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=None,resume_data=None,skip_storefront=False):
     out_dir=Path(out_dir);out_dir.mkdir(parents=True,exist_ok=True)
     old=resume_data or {};selected={(m,a) for a,m in seeds}
-    products={(p['marketplace'],p['asin']):p for p in old.get('products',[]) if (p['marketplace'],p['asin']) in selected}
+    zips={**ZIPS,**CITY_MARKETS,**(zips or {})}
+    # A changed or unconfirmed destination invalidates the market's old offers.
+    invalid_markets={p['marketplace'] for p in old.get('products',[])
+        if (p['marketplace'],p['asin']) in selected and p.get('title')
+        and re.sub(r'\s+','',str(p.get('delivery_zip') or '')).casefold()!=re.sub(r'\s+','',str(zips.get(p['marketplace']) or '')).casefold()}
+    if invalid_markets:LOG.warning('Delivery destination changed or was not confirmed; refreshing all listings and profiles for: %s',', '.join(sorted(invalid_markets)))
+    products={(p['marketplace'],p['asin']):p for p in old.get('products',[]) if (p['marketplace'],p['asin']) in selected and p['marketplace'] not in invalid_markets}
     seller_keys={(p['marketplace'],p['seller_id']) for p in products.values() if p.get('seller_id')}
     groups={(g['marketplace'],g['seller_id']):g for g in old.get('groups',[]) if (g['marketplace'],g['seller_id']) in seller_keys}
     events=[];run_status='RUNNING';located={};current_market=None
     attempted_profiles=set();profile_failures=0
-    zips={**ZIPS,**CITY_MARKETS,**(zips or {})}
     def add_event(url,status,sink=events):
         sink.append({'url':url,'status':status,'observed_at':datetime.now(timezone.utc).isoformat(timespec='seconds')})
     def checkpoint(export=False):
@@ -539,9 +552,9 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
             for row in group['products'].values():all_products.setdefault((row['marketplace'],row['asin']),row)
         for asin,market in seeds:all_products.setdefault((market,asin),missing_product(asin,market,'NOT_PROCESSED'))
         logs=events+[e for g in groups.values() for e in g['events']]
-        write_json_atomic(out_dir/'checkpoint.json',{'version':1,'run_status':run_status,'seeds':seeds,
+        write_json_atomic(out_dir/'checkpoint.json',{'version':1,'run_status':run_status,'seeds':seeds,'delivery_settings':zips,
             'products':list(all_products.values()),'groups':list(groups.values()),'events':logs})
-        if export:export_run_report(out_dir/'result.xlsx',seeds,list(all_products.values()),groups,logs,run_status)
+        if export:export_run_report(out_dir/'result.xlsx',seeds,list(all_products.values()),groups,logs,run_status,delivery_settings=zips)
     def save_group(market,seller_id,g):
         if not g.get('seller'):return
         filename=out_dir/f'{market}_{safe_filename(seller_id)}'
@@ -551,10 +564,22 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
         nonlocal current_market
         if current_market==market:return
         status,shown=set_delivery(page,market,zips.get(market))
-        located[market]=zips.get(market,'') if status=='OK' else ''
-        current_market=market
         add_event(f'delivery:{market}:{zips.get(market,"")}',f'{status} {shown}'.strip())
-        if status!='OK':LOG.warning('Delivery location for %s not confirmed: %s',market,status)
+        if status in MANUAL_STATES and not headless:
+            manual_navigation(page,f'https://{MARKETS[market][0]}/',navigate,status)
+            status,shown=set_delivery(page,market,zips.get(market))
+            add_event(f'delivery:{market}:{zips.get(market,"")}',f'{status} {shown}'.strip())
+        if status!='OK' or not delivery_matches(shown,zips.get(market)):
+            raise ProfileAccessRequired(f'Delivery {market} {zips.get(market)} not confirmed: {status}; shown: {shown or "unknown"}. No listings collected for this destination.')
+        located[market]=zips[market]
+        current_market=market
+        LOG.info('Delivery confirmed: %s %s (%s)',market,zips[market],shown)
+    def verify_page_location(html,state,url,market):
+        if not html or state!='HTTP_200':return
+        shown=pick(BeautifulSoup(html,'lxml'),'#glow-ingress-line2')
+        if not delivery_matches(shown,zips.get(market)):
+            add_event(url,f'DELIVERY_MISMATCH: expected {market} {zips.get(market)}; shown: {shown or "unknown"}')
+            raise ProfileAccessRequired(f'Delivery changed or is not visible: expected {market} {zips.get(market)}; shown: {shown or "unknown"}. Progress saved.')
     def collect_profile(page,market,seller_id,g):
         nonlocal profile_failures
         previous=g.get('seller') or {}
@@ -600,6 +625,7 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
                             if headless:raise ProfileAccessRequired(f'{state}: resume with --no-headless --resume to complete verification.')
                             html,state=manual_navigation(page,url,navigate,state)
                             if state in MANUAL_STATES:raise ProfileAccessRequired(f'{state}: verification is still required.')
+                        verify_page_location(html,state,url,market)
                         product=parse_product(html,asin,market) if html else missing_product(asin,market,state)
                         product['delivery_zip']=located.get(market,'')
                         if html and not product.get('seller_id'):product['status']='NO_SELLER_ID' if product.get('title') else 'UNVERIFIED'
@@ -625,6 +651,7 @@ def run(seeds,out_dir,headless=True,max_pages=3,max_products=100,delay=2.0,zips=
                                 if headless:raise ProfileAccessRequired(f'{state}: catalog product needs verification; resume with --no-headless --resume.')
                                 html,state=manual_navigation(page,url,navigate,state)
                                 if state in MANUAL_STATES:raise ProfileAccessRequired(f'{state}: verification is still required.')
+                            verify_page_location(html,state,url,market)
                             p=parse_product(html,asin,market) if html else missing_product(asin,market,state)
                             p['delivery_zip']=located.get(market,'')
                             if p.get('seller_id') and p['seller_id']!=seller_id:p['status']='DIFFERENT_BUYBOX_SELLER'
